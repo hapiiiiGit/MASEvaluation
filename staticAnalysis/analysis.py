@@ -9,6 +9,66 @@ from collections import Counter
 from pathlib import Path
 from typing import Optional
 
+# Matches lines like:
+#   # ===== filename.py =====
+#   # ---- config.py ----
+#   # ========================= main.py =========================
+#   # =========================   (no filename)
+# The captured group 1 is the filename (stripped), or empty string.
+_SEPARATOR_RE = re.compile(
+    r"^\s*#\s*[=\-]{5,}\s*(.*?)\s*[=\-]{5,}\s*$"
+)
+
+def split_multi_file_code(code: str) -> list[tuple[str, str]]:
+    """
+    Split *code* into (filename, content) pairs when it contains multi-file
+    separator comments.  Returns [(filename, content), ...].
+
+    If no separators are found, returns [("", code)] so the caller can treat
+    single-file and multi-file outputs uniformly.
+
+    filename may be an empty string when the separator line carries no name,
+    or a descriptive label like "END OF FILES" / "Unit Tests".
+    """
+    lines = code.splitlines(keepends=True)
+    segments: list[tuple[str, list[str]]] = []  # (filename, lines)
+
+    current_name: str | None = None
+    current_lines: list[str] = []
+
+    for line in lines:
+        m = _SEPARATOR_RE.match(line)
+        if m:
+            inner = m.group(1).strip()
+            # inner may be e.g. "config.py", "File: utils.py", "END OF FILES", ""
+            # strip common prefixes like "File: " or "file: "
+            filename = re.sub(r"(?i)^file\s*:\s*", "", inner).strip()
+
+            if current_name is not None:
+                segments.append((current_name, current_lines))
+            current_name = filename
+            current_lines = []
+        else:
+            if current_name is None:
+                # code before the first separator – treat as preamble
+                current_name = ""
+            current_lines.append(line)
+
+    if current_name is not None and current_lines:
+        segments.append((current_name, current_lines))
+
+    if not segments:
+        return [("", code)]
+
+    # If no separator was ever hit, segments will have a single ("", ...) entry
+    has_real_separator = len(segments) > 1 or (
+        len(segments) == 1 and segments[0][0] != ""
+    )
+    if not has_real_separator:
+        return [("", code)]
+
+    return [(name, "".join(lines_)) for name, lines_ in segments]
+
 
 def run_pylint_json(py_file: Path) -> list:
     """Run pylint on *py_file* and return the parsed JSON issue list."""
@@ -55,10 +115,7 @@ def summarise_issues(issues: list) -> dict:
             symbol_counts[t][sym] += 1
 
     def fmt(counter: Counter) -> str:
-        """Format as 'symbol:count|symbol:count', sorted by count desc."""
-        return "|".join(
-            f"{sym}:{n}" for sym, n in counter.most_common()
-        )
+        return "|".join(f"{sym}:{n}" for sym, n in counter.most_common())
 
     return {
         "total_issues":     len(issues),
@@ -75,10 +132,47 @@ def summarise_issues(issues: list) -> dict:
     }
 
 
+def _is_py_segment(filename: str, content: str) -> bool:
+    """Return True if this segment should be linted as Python."""
+    if not content.strip():
+        return False
+    # Skip obvious non-Python segments by filename extension
+    if filename:
+        ext = Path(filename).suffix.lower()
+        if ext and ext not in (".py", ""):
+            return False
+    # Skip section markers with no real code (e.g. "END OF FILES", "Unit Tests")
+    # Heuristic: if fewer than 2 non-comment, non-blank lines → skip
+    real_lines = [
+        l for l in content.splitlines()
+        if l.strip() and not l.strip().startswith("#")
+    ]
+    return len(real_lines) >= 2
+
+
+def _pylint_segment(content: str) -> tuple[list, str]:
+    """Write *content* to a temp file, run pylint, return (issues, score)."""
+    with tempfile.NamedTemporaryFile(
+        suffix=".py", mode="w", encoding="utf-8", delete=False
+    ) as tmp:
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
+    try:
+        issues = run_pylint_json(tmp_path)
+        score  = run_pylint_score(tmp_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return issues, score
+
+
 def process_json_file(json_path: Path) -> Optional[dict]:
     """
     Extract final_code from *json_path*, run pylint, and return a stats row.
     Returns None if the file should be skipped.
+
+    When final_code contains multi-file separators, each Python segment is
+    linted independently and results are aggregated, avoiding false positives
+    caused by import-order and name-collision artefacts from concatenation.
     """
     try:
         data = json.loads(json_path.read_text(encoding="utf-8"))
@@ -86,7 +180,7 @@ def process_json_file(json_path: Path) -> Optional[dict]:
         print(f"[SKIP] {json_path.name}: cannot read JSON – {exc}")
         return None
 
-    # final_code ma1y be at the top level or nested under "result"
+    # final_code may be at the top level or nested under "result"
     code = data.get("final_code") or data.get("result", {}).get("final_code", "")
     if not isinstance(code, str) or not code.strip():
         print(f"[SKIP] {json_path.name}: 'final_code' is missing or empty")
@@ -94,28 +188,41 @@ def process_json_file(json_path: Path) -> Optional[dict]:
 
     task_id = data.get("task_id") or data.get("result", {}).get("task_id", json_path.stem)
 
-    # Write code to a temp .py file so pylint can analyse it
-    with tempfile.NamedTemporaryFile(
-        suffix=".py", mode="w", encoding="utf-8", delete=False
-    ) as tmp:
-        tmp.write(code)
-        tmp_path = Path(tmp.name)
+    segments = split_multi_file_code(code)
+    py_segments = [(name, content) for name, content in segments if _is_py_segment(name, content)]
+
+    # Fall back to whole-code analysis if splitting produced nothing useful
+    if not py_segments:
+        py_segments = [("", code)]
+
+    is_multi = len(py_segments) > 1
+
+    all_issues: list = []
+    scores: list[str] = []
+
+    for _, content in py_segments:
+        issues, score = _pylint_segment(content)
+        all_issues.extend(issues)
+        if score != "N/A":
+            scores.append(score)
+
+    # Aggregate score: average of per-file scores (or N/A)
+    if scores:
+        avg = sum(float(s.split("/")[0]) for s in scores) / len(scores)
+        agg_score = f"{avg:.2f}/10"
+    else:
+        agg_score = "N/A"
 
     loc = sum(1 for line in code.splitlines() if line.strip())
+    stats = summarise_issues(all_issues)
 
-    try:
-        issues = run_pylint_json(tmp_path)
-        score  = run_pylint_score(tmp_path)
-        stats  = summarise_issues(issues)
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
+    tag = f"[{len(py_segments)} files]" if is_multi else ""
     print(
-        f"[OK] {task_id:<20s} | score={score:<8s} | LOC={loc} | "
+        f"[OK] {task_id:<20s} | score={agg_score:<8s} | LOC={loc} {tag}| "
         f"E={stats['error_count']} W={stats['warning_count']} "
         f"C={stats['convention_count']} R={stats['refactor_count']}"
     )
-    return {"task_id": task_id, "pylint_score": score, "loc": loc, **stats}
+    return {"task_id": task_id, "pylint_score": agg_score, "loc": loc, **stats}
 
 
 CSV_FIELDS = [
