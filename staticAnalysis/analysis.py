@@ -9,12 +9,6 @@ from collections import Counter
 from pathlib import Path
 from typing import Optional
 
-# Matches lines like:
-#   # ===== filename.py =====
-#   # ---- config.py ----
-#   # ========================= main.py =========================
-#   # =========================   (no filename)
-# The captured group 1 is the filename (stripped), or empty string.
 _SEPARATOR_RE = re.compile(
     r"^\s*#\s*[=\-]{5,}\s*(.*?)\s*[=\-]{5,}\s*$"
 )
