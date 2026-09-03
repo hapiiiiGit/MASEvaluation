@@ -1,23 +1,3 @@
-"""
-run_experiment.py  —  Full pipeline for gpt-4.1-2025-04-14
-
-Steps:
-  1. Run multiAgent graphs (solo_programmer, planner_programmer,
-     planner_architect_programmer, planner_architect_programmer_reviewer,
-     planner_architect_programmer_reviewer_tester) for all 339 tasks.
-  2. For each graph: run LLMasJudge feature coverage evaluation.
-  3. For each graph: run staticAnalysis pylint summary.
-
-Run from the project root:
-    conda run -n mastesting python run_experiment.py
-
-Optional flags:
-    --skip-run        Skip step 1 (reuse existing results)
-    --skip-judge      Skip step 2
-    --skip-static     Skip step 3
-    --graphs GRAPH [GRAPH ...]   Only process these graphs
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -26,9 +6,6 @@ import sys
 import time
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
 MODEL = "gpt-4.1-2025-04-14"
 MODEL_FOLDER = "gpt-4.1-2025-04-14-runs"
@@ -45,9 +22,6 @@ GRAPHS = [
 OUTPUTS_ROOT = Path("multiAgent/outputs") / MODEL_FOLDER
 TASK_FILE = "Task/feature-final.json"
 
-# ---------------------------------------------------------------------------
-# Python executable resolution
-# ---------------------------------------------------------------------------
 
 MASTESTING_PYTHON: str | None = None  # resolved in main()
 
@@ -64,18 +38,13 @@ def resolve_python() -> str:
 
     # Fallback: direct paths
     fallbacks = [
-        f"C:\\Users\\ZhouY\\anaconda3\\envs\\{CONDA_ENV}\\python.exe",
-        f"/c/Users/ZhouY/anaconda3/envs/{CONDA_ENV}/python.exe",
+        f"\\{CONDA_ENV}\\python.exe",
+        f"/{CONDA_ENV}/python.exe",
     ]
     for p in fallbacks:
         if Path(p).is_file():
             return p
     return sys.executable
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def banner(text: str) -> None:
     line = "=" * 70
@@ -106,11 +75,6 @@ def run(script_args: list[str], step_label: str) -> bool:
         print(f"[FAIL] {step_label} exited with code {result.returncode}  ({elapsed:.1f}s)\n",
               flush=True)
         return False
-
-
-# ---------------------------------------------------------------------------
-# Steps
-# ---------------------------------------------------------------------------
 
 def step1_run_graphs(graphs: list[str]) -> bool:
     banner(f"STEP 1 — Run multiAgent graphs  (model={MODEL})")
@@ -160,10 +124,6 @@ def step3_static_analysis(graphs: list[str]) -> dict[str, bool]:
     return results
 
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-
 def print_summary(
     graphs: list[str],
     step1_ok: bool | None,
@@ -191,9 +151,7 @@ def print_summary(
     print()
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Full experiment pipeline for gpt-4.1-2025-04-14")
